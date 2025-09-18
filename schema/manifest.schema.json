@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Manifest",
+  "type": "object",
+  "required": ["module", "files"],
+  "properties": {
+    "module": {"type": "string"},
+    "jdk": {"type": "string"},
+    "build": {"type": "string"},
+    "entrypoints": {"type": "array", "items": {"type": "string"}},
+    "packagesRoot": {"type": "string"},
+    "sourceGlobs": {"type": "array", "items": {"type": "string"}},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": {"type": "string"},
+          "package": {"type": "string"},
+          "class": {"type": "string"},
+          "kind": {"type": "string"},
+          "summary": {"type": "string"},
+          "exports": {"type": "array", "items": {"type": "string"}},
+          "dependsOn": {"type": "array", "items": {"type": "string"}},
+          "hash": {"type": "string"},
+          "lines": {"type": "integer"},
+          "anchors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "start", "end"],
+              "properties": {
+                "name": {"type": "string"},
+                "start": {"type": "integer"},
+                "end": {"type": "integer"}
+              }
+            }
+          },
+          "tags": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

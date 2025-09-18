@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Symbols",
+  "type": "object",
+  "required": ["version", "symbols"],
+  "properties": {
+    "version": {"type": "integer"},
+    "symbols": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "kind", "path", "start", "end"],
+        "properties": {
+          "symbol": {"type": "string"},
+          "kind": {"type": "string"},
+          "path": {"type": "string"},
+          "start": {"type": "integer"},
+          "end": {"type": "integer"}
+        }
+      }
+    }
+  }
+}
