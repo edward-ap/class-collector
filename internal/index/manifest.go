@@ -5,6 +5,8 @@ package index
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +25,67 @@ import (
 //     Files with language not in the set are skipped.
 //   - maxFileLines controls the threshold for generating fallback slices in files
 //     without anchors (see BuildSlices).
+//
+// ComputeBundleID computes a canonical hash over manifest entries.
+// It concatenates lines "<normalized-path>:<lowercase-hash>\n" sorted by path,
+// then returns SHA-256 hex(lowercase) of the UTF-8 bytes.
+func ComputeBundleID(man Manifest) string {
+	if len(man.Files) == 0 {
+		sum := sha256.Sum256(nil)
+		return hex.EncodeToString(sum[:])
+	}
+	lines := make([]string, 0, len(man.Files))
+	for _, f := range man.Files {
+		p := normalizePath(f.Path)
+		h := toLowerHex(f.Hash)
+		lines = append(lines, p+":"+h)
+	}
+	sort.Strings(lines)
+	var buf bytes.Buffer
+	for _, ln := range lines {
+		buf.WriteString(ln)
+		buf.WriteByte('\n')
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	return hex.EncodeToString(sum[:])
+}
+
+func normalizePath(p string) string {
+	// unify slashes, drop leading "./", collapse duplicate '/'
+	b := make([]rune, 0, len(p))
+	skipDotSlash := false
+	for i, r := range p {
+		if i == 0 && r == '.' && len(p) > 1 && p[1] == '/' {
+			skipDotSlash = true
+			continue
+		}
+		if skipDotSlash && r == '/' {
+			skipDotSlash = false
+			continue
+		}
+		if r == '\\' {
+			r = '/'
+		}
+		if r == '/' && len(b) > 0 && b[len(b)-1] == '/' {
+			continue
+		}
+		b = append(b, r)
+	}
+	return string(b)
+}
+
+func toLowerHex(s string) string {
+	out := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'F' {
+			c = c + ('a' - 'A')
+		}
+		out[i] = c
+	}
+	return string(out)
+}
+
 func BuildArtifacts(root string, files []walkwalk.FileInfo, maxFileLines int, langHints map[string]struct{}) (Manifest, Symbols, []Slice, []Pointer) {
 	var (
 		allManFiles []ManFile
@@ -170,6 +233,8 @@ func BuildArtifacts(root string, files []walkwalk.FileInfo, maxFileLines int, la
 	})
 
 	man := Manifest{Module: filepath.Base(root), Files: allManFiles}
+	// compute canonical bundle id
+	man.BundleID = ComputeBundleID(man)
 	symsOut := Symbols{Version: 1, Symbols: allSyms}
 	return man, symsOut, allSlices, allPointers
 }

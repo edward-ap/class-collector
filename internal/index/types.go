@@ -35,6 +35,7 @@ type Manifest struct {
 	Entrypoints  []string  `json:"entrypoints,omitempty"`  // optional fully-qualified entry symbols
 	SourceGlobs  []string  `json:"sourceGlobs,omitempty"`  // optional source patterns
 	Files        []ManFile `json:"files"`                  // manifest entries (deterministic order)
+	BundleID     string    `json:"bundle_id,omitempty"`    // canonical bundle hash (SHA-256 over sorted "path:hash\n")
 }
 
 // Symbol represents a discovered code symbol suitable for navigation.

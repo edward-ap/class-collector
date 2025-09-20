@@ -63,6 +63,12 @@ func WriteFull(
 	if err := writeJSONEntry(zw, "symbols.json", syms); err != nil {
 		return err
 	}
+	// OPTIONAL: write plain-text bundle id for quick checks
+	if man.BundleID != "" {
+		if err := writeTextEntry(zw, "BUNDLE.ID", []byte(man.BundleID+"\n")); err != nil {
+			return err
+		}
+	}
 
 	// graph.json — write real graph
 	if err := writeJSONEntry(zw, "graph.json", g); err != nil {
