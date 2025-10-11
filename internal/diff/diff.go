@@ -21,9 +21,13 @@ type Options struct {
 	// TimeoutSeconds kept for backward compatibility. difflib does not use it.
 	TimeoutSeconds float64
 
-	// PatchMargin controls the number of CONTEXT LINES in unified hunks.
+	// Context controls the number of CONTEXT LINES in unified hunks.
 	// If 0, default to 4.
-	PatchMargin int
+	Context int
+
+	// NoPrefix controls whether FromFile/ToFile are prefixed with "a/" and "b/".
+	// When true, the paths passed by the caller are used as-is.
+	NoPrefix bool
 
 	// LineMode kept for backward compatibility (unified output is line-based).
 	LineMode bool
@@ -37,7 +41,7 @@ func Unified(aName, bName string, a, b []byte, opt Options) (body string, oversi
 		return omitted(aName, bName), true
 	}
 
-	ctx := opt.PatchMargin
+	ctx := opt.Context
 	if ctx <= 0 {
 		ctx = 4
 	}
@@ -65,9 +69,13 @@ func Added(bName string, b []byte, opt Options) (string, bool) {
 	if opt.MaxBytes > 0 && len(b) > opt.MaxBytes {
 		return omitted("/dev/null", bName), true
 	}
-	ctx := opt.PatchMargin
+	ctx := opt.Context
 	if ctx <= 0 {
 		ctx = 4
+	}
+	// Ensure no "b/" prefix in ToFile per policy.
+	if strings.HasPrefix(bName, "b/") {
+		bName = bName[2:]
 	}
 	u := difflib.UnifiedDiff{
 		A:        []string{},                  // empty "from"

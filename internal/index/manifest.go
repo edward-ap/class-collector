@@ -11,21 +11,10 @@ import (
 	"path/filepath"
 	"sort"
 
+	"class-collector/internal/graph"
 	"class-collector/internal/walkwalk"
 )
 
-// BuildArtifacts walks the provided FileInfo set and produces:
-//   - Manifest  : per-file metadata (package/class/kind/exports/hash/lines/anchors)
-//   - Symbols   : flattened list of extracted symbols with 1-based line ranges
-//   - Slices    : regions for large files (prefer anchors; fallback to chunking)
-//   - Pointers  : jump targets for anchors and symbols
-//
-// Notes:
-//   - langHints, when non-empty, is a set of language tags to keep (e.g. {"java","go","ts"}).
-//     Files with language not in the set are skipped.
-//   - maxFileLines controls the threshold for generating fallback slices in files
-//     without anchors (see BuildSlices).
-//
 // ComputeBundleID computes a canonical hash over manifest entries.
 // It concatenates lines "<normalized-path>:<lowercase-hash>\n" sorted by path,
 // then returns SHA-256 hex(lowercase) of the UTF-8 bytes.
@@ -51,7 +40,6 @@ func ComputeBundleID(man Manifest) string {
 }
 
 func normalizePath(p string) string {
-	// unify slashes, drop leading "./", collapse duplicate '/'
 	b := make([]rune, 0, len(p))
 	skipDotSlash := false
 	for i, r := range p {
@@ -86,155 +74,221 @@ func toLowerHex(s string) string {
 	return string(out)
 }
 
-func BuildArtifacts(root string, files []walkwalk.FileInfo, maxFileLines int, langHints map[string]struct{}) (Manifest, Symbols, []Slice, []Pointer) {
-	var (
-		allManFiles []ManFile
-		allSyms     []Symbol
-		allSlices   []Slice
-		allPointers []Pointer
-	)
+// Artifacts bundles the primary indexing outputs alongside the graph.
+type Artifacts struct {
+	Manifest Manifest
+	Symbols  Symbols
+	Slices   []Slice
+	Pointers []Pointer
+	Graph    graph.Graph
+}
 
+type symbolsIndex struct {
+	manifest []ManFile
+	symbols  []Symbol
+	slices   []Slice
+	pointers []Pointer
+}
+
+type fileArtifacts struct {
+	manifest ManFile
+	symbols  []Symbol
+	slices   []Slice
+	pointers []Pointer
+}
+
+// BuildArtifacts remains the primary entry point for callers that expect the
+// original tuple signature. Internally it delegates to buildArtifactsSet.
+func BuildArtifacts(root string, files []walkwalk.FileInfo, maxFileLines int, langHints map[string]struct{}) (Manifest, Symbols, []Slice, []Pointer) {
+	art, err := buildArtifactsSet(root, files, maxFileLines, langHints)
+	if err != nil {
+		return Manifest{Module: filepath.Base(root)}, Symbols{}, nil, nil
+	}
+	return art.Manifest, art.Symbols, art.Slices, art.Pointers
+}
+
+func buildArtifactsSet(root string, files []walkwalk.FileInfo, maxFileLines int, langHints map[string]struct{}) (Artifacts, error) {
+	idx, err := gatherSymbolsIndex(files, maxFileLines, langHints)
+	if err != nil {
+		return Artifacts{}, err
+	}
+	g, err := computeGraph(files)
+	if err != nil {
+		return Artifacts{}, err
+	}
+	return assembleArtifacts(root, idx, g)
+}
+
+func gatherSymbolsIndex(files []walkwalk.FileInfo, maxFileLines int, langHints map[string]struct{}) (symbolsIndex, error) {
+	var idx symbolsIndex
 	for _, f := range files {
 		data, err := os.ReadFile(f.AbsPath)
 		if err != nil {
 			continue
 		}
-
-		// Anchors (regions) are used both for manifest metadata and for building slices/pointers.
-		anchors := ExtractAnchors(f.RelPath, data)
-
-		// Language & symbol extraction
-		lang := InferLangByExt(f.Ext)
-		var pkg, kind, typ string
-		var exports []string
-		var syms []Symbol
-
-		switch lang {
-		case "java":
-			pkg, kind, typ, exports, syms = extractJava(f.RelPath, data)
-		case "go":
-			pkg, kind, typ, exports, syms = extractGo(f.RelPath, data)
-		case "ts":
-			pkg, kind, typ, exports, syms = extractTS(f.RelPath, data)
-		case "kt":
-			pkg, kind, typ, exports, syms = extractKotlin(f.RelPath, data)
-		case "cs":
-			pkg, kind, typ, exports, syms = extractCS(f.RelPath, data)
-		case "py":
-			pkg, kind, typ, exports, syms = extractPy(f.RelPath, data)
-		default:
-			kind = "file"
+		fa, err := processFile(f, data, maxFileLines, langHints)
+		if err != nil || fa == nil {
+			continue
 		}
+		idx.manifest = append(idx.manifest, fa.manifest)
+		idx.symbols = append(idx.symbols, fa.symbols...)
+		idx.slices = append(idx.slices, fa.slices...)
+		idx.pointers = append(idx.pointers, fa.pointers...)
+	}
+	return idx, nil
+}
 
-		// Language hints filtering:
-		// If hints are provided, keep only files whose inferred language is in the set.
-		if len(langHints) > 0 {
-			if _, ok := langHints[lang]; !ok {
-				// Unknown/empty lang or not requested → skip this file entirely.
-				continue
-			}
-		}
+func processFile(f walkwalk.FileInfo, data []byte, maxFileLines int, langHints map[string]struct{}) (*fileArtifacts, error) {
+	anchors := ExtractAnchors(f.RelPath, data)
+	lang := InferLangByExt(f.Ext)
+	var pkg, kind, typ string
+	var exports []string
+	var syms []Symbol
 
-		// Total line count (1-based, '\n'-counting).
-		totalLines := 1 + bytes.Count(data, []byte("\n"))
-
-		// Finalize symbol End lines within the file, based on next symbol start (or file end).
-		sort.Slice(syms, func(i, j int) bool { return syms[i].Start < syms[j].Start })
-		for i := range syms {
-			if i+1 < len(syms) {
-				syms[i].End = syms[i+1].Start - 1
-				if syms[i].End < syms[i].Start {
-					syms[i].End = syms[i].Start
-				}
-			} else {
-				syms[i].End = totalLines
-			}
-		}
-
-		// Manifest entry for this file
-		mf := ManFile{
-			Path:    f.RelPath,
-			Package: pkg,
-			Class:   typ,
-			Kind:    kind,
-			Summary: "",
-			Exports: exports,
-			Hash:    f.SHA256Hex,
-			Lines:   totalLines,
-			Anchors: anchors,
-		}
-
-		// Accumulate symbols; pointers are built later via BuildSymbolPointers(allSyms).
-		for i := range syms {
-			allSyms = append(allSyms, syms[i])
-		}
-
-		// Synthesize virtual anchors (symbols/imports/tests)
-		if aa := BuildAutoAnchors(f.RelPath, data, lang, syms, anchors, totalLines); len(aa) > 0 {
-			anchors = append(anchors, aa...)
-		}
-		// Emit manifest entry with combined anchors
-		mf = ManFile{
-			Path: f.RelPath, Package: pkg, Class: typ, Kind: kind,
-			Summary: "", Exports: exports, Hash: f.SHA256Hex, Lines: totalLines,
-			Anchors: anchors,
-		}
-		allManFiles = append(allManFiles, mf)
-
-		// Slices (prefer anchors; fallback to chunking for large files without anchors).
-		if sl := BuildSlices(f.RelPath, anchors, totalLines, maxFileLines); len(sl) > 0 {
-			allSlices = append(allSlices, sl...)
-		}
-
-		// Anchor-backed pointers (already carry Start/End).
-		allPointers = append(allPointers, BuildAnchorPointers(f.RelPath, anchors)...)
+	switch lang {
+	case "java":
+		pkg, kind, typ, exports, syms = extractJava(f.RelPath, data)
+	case "go":
+		pkg, kind, typ, exports, syms = extractGo(f.RelPath, data)
+	case "ts":
+		pkg, kind, typ, exports, syms = extractTS(f.RelPath, data)
+	case "kt":
+		pkg, kind, typ, exports, syms = extractKotlin(f.RelPath, data)
+	case "cs":
+		pkg, kind, typ, exports, syms = extractCS(f.RelPath, data)
+	case "py":
+		pkg, kind, typ, exports, syms = extractPy(f.RelPath, data)
+	case "cpp":
+		pkg, kind, typ, exports, syms = extractCPP(f.RelPath, data)
+	default:
+		kind = "file"
 	}
 
-	// Build symbol-backed pointers after collecting all symbols.
-	symPtrs := BuildSymbolPointers(allSyms)
-	if len(symPtrs) > 0 {
-		allPointers = append(allPointers, symPtrs...)
+	if len(langHints) > 0 {
+		if _, ok := langHints[lang]; !ok {
+			return nil, nil
+		}
 	}
 
-	// Deterministic ordering for reproducible bundles.
-	sort.Slice(allManFiles, func(i, j int) bool { return allManFiles[i].Path < allManFiles[j].Path })
+	totalLines := 1 + bytes.Count(data, []byte("\n"))
 
-	sort.Slice(allSyms, func(i, j int) bool {
-		if allSyms[i].Path == allSyms[j].Path {
-			if allSyms[i].Start == allSyms[j].Start {
-				return allSyms[i].End < allSyms[j].End
+	sort.Slice(syms, func(i, j int) bool { return syms[i].Start < syms[j].Start })
+	for i := range syms {
+		if i+1 < len(syms) {
+			syms[i].End = syms[i+1].Start - 1
+			if syms[i].End < syms[i].Start {
+				syms[i].End = syms[i].Start
 			}
-			return allSyms[i].Start < allSyms[j].Start
+		} else {
+			syms[i].End = totalLines
 		}
-		return allSyms[i].Path < allSyms[j].Path
+	}
+
+	if aa := BuildAutoAnchors(f.RelPath, data, lang, syms, anchors, totalLines); len(aa) > 0 {
+		anchors = append(anchors, aa...)
+	}
+
+	mf := ManFile{
+		Path:    f.RelPath,
+		Package: pkg,
+		Class:   typ,
+		Kind:    kind,
+		Summary: "",
+		Exports: exports,
+		Hash:    f.SHA256Hex,
+		Lines:   totalLines,
+		Anchors: anchors,
+	}
+
+	var slices []Slice
+	if sl := BuildSlices(f.RelPath, anchors, totalLines, maxFileLines); len(sl) > 0 {
+		slices = append(slices, sl...)
+	}
+	pointers := BuildAnchorPointers(f.RelPath, anchors)
+
+	return &fileArtifacts{
+		manifest: mf,
+		symbols:  syms,
+		slices:   slices,
+		pointers: pointers,
+	}, nil
+}
+
+func computeGraph(files []walkwalk.FileInfo) (graph.Graph, error) {
+	if len(files) == 0 {
+		return graph.Graph{}, nil
+	}
+	gfiles := make([]graph.File, 0, len(files))
+	for _, f := range files {
+		gfiles = append(gfiles, graph.File{
+			RelPath: f.RelPath,
+			AbsPath: f.AbsPath,
+			Ext:     f.Ext,
+		})
+	}
+	return graph.BuildFrom(gfiles), nil
+}
+
+func assembleArtifacts(root string, idx symbolsIndex, g graph.Graph) (Artifacts, error) {
+	manFiles := make([]ManFile, len(idx.manifest))
+	copy(manFiles, idx.manifest)
+	sort.Slice(manFiles, func(i, j int) bool { return manFiles[i].Path < manFiles[j].Path })
+
+	symbols := make([]Symbol, len(idx.symbols))
+	copy(symbols, idx.symbols)
+
+	slices := make([]Slice, len(idx.slices))
+	copy(slices, idx.slices)
+	sort.Slice(slices, func(i, j int) bool {
+		if slices[i].Path == slices[j].Path {
+			if slices[i].Start == slices[j].Start {
+				return slices[i].End < slices[j].End
+			}
+			return slices[i].Start < slices[j].Start
+		}
+		return slices[i].Path < slices[j].Path
 	})
 
-	sort.Slice(allSlices, func(i, j int) bool {
-		if allSlices[i].Path == allSlices[j].Path {
-			if allSlices[i].Start == allSlices[j].Start {
-				return allSlices[i].End < allSlices[j].End
-			}
-			return allSlices[i].Start < allSlices[j].Start
+	pointers := make([]Pointer, len(idx.pointers))
+	copy(pointers, idx.pointers)
+	if len(symbols) > 0 {
+		if symPtrs := BuildSymbolPointers(symbols); len(symPtrs) > 0 {
+			pointers = append(pointers, symPtrs...)
 		}
-		return allSlices[i].Path < allSlices[j].Path
+	}
+
+	sort.Slice(symbols, func(i, j int) bool {
+		if symbols[i].Path == symbols[j].Path {
+			if symbols[i].Start == symbols[j].Start {
+				return symbols[i].End < symbols[j].End
+			}
+			return symbols[i].Start < symbols[j].Start
+		}
+		return symbols[i].Path < symbols[j].Path
 	})
 
-	sort.Slice(allPointers, func(i, j int) bool {
-		if allPointers[i].ID == allPointers[j].ID {
-			if allPointers[i].Path == allPointers[j].Path {
-				if allPointers[i].Start == allPointers[j].Start {
-					return allPointers[i].End < allPointers[j].End
+	sort.Slice(pointers, func(i, j int) bool {
+		if pointers[i].ID == pointers[j].ID {
+			if pointers[i].Path == pointers[j].Path {
+				if pointers[i].Start == pointers[j].Start {
+					return pointers[i].End < pointers[j].End
 				}
-				return allPointers[i].Start < allPointers[j].Start
+				return pointers[i].Start < pointers[j].Start
 			}
-			return allPointers[i].Path < allPointers[j].Path
+			return pointers[i].Path < pointers[j].Path
 		}
-		return allPointers[i].ID < allPointers[j].ID
+		return pointers[i].ID < pointers[j].ID
 	})
 
-	man := Manifest{Module: filepath.Base(root), Files: allManFiles}
-	// compute canonical bundle id
+	man := Manifest{Module: filepath.Base(root), Files: manFiles}
 	man.BundleID = ComputeBundleID(man)
-	symsOut := Symbols{Version: 1, Symbols: allSyms}
-	return man, symsOut, allSlices, allPointers
+	symOut := Symbols{Version: 1, Symbols: symbols}
+
+	return Artifacts{
+		Manifest: man,
+		Symbols:  symOut,
+		Slices:   slices,
+		Pointers: pointers,
+		Graph:    g,
+	}, nil
 }

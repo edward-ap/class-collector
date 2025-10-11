@@ -77,6 +77,8 @@ func InferLangByExt(ext string) string {
 		return "cs"
 	case ".py":
 		return "py"
+	case ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".h":
+		return "cpp"
 	default:
 		return ""
 	}

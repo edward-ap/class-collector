@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"class-collector/internal/cache"
@@ -89,67 +90,93 @@ func MakeDiffs(
 	opt diff.Options,
 	readOld func(hash string) ([]byte, error),
 ) (map[string]string, error) {
-
-	// Index current files by relative path.
 	byPath := make(map[string]walkwalk.FileInfo, len(files))
 	for _, f := range files {
 		byPath[f.RelPath] = f
 	}
 
-	out := make(map[string]string, len(d.Changed))
-	usedNames := make(map[string]struct{}, len(d.Changed)) // to ensure unique names
+	patches := make([]generatedPatch, 0, len(d.Changed))
+	usedNames := make(map[string]struct{}, len(d.Changed))
 
 	for i := range d.Changed {
 		chg := &d.Changed[i]
 
-		// Read old version (a).
-		var a []byte
+		var oldData []byte
 		if readOld != nil && chg.HashBefore != "" {
-			if ab, err := readOld(chg.HashBefore); err == nil && len(ab) > 0 {
-				a = ab
+			if data, err := readOld(chg.HashBefore); err == nil && len(data) > 0 {
+				oldData = data
 			}
 		}
 
-		// Read new version (b).
-		var b []byte
+		var newData []byte
 		if fi, ok := byPath[chg.Path]; ok {
-			if nb, err := os.ReadFile(fi.AbsPath); err == nil {
-				b = nb
+			if data, err := os.ReadFile(fi.AbsPath); err == nil {
+				newData = data
 			}
 		}
 
-		// Build a deterministic, filesystem-safe patch name.
 		base := safeDiffBase(chg.Path)
-		// Prefer HashAfter as hashHint (when available) so names remain stable
-		// for identical resulting content.
 		hashHint := chg.HashAfter
 		if hashHint == "" {
-			// fallback: short hash of the path
 			hashHint = shortHash(chg.Path)
 		}
 		patchName := uniquePatchName(base, hashHint[:min(len(hashHint), 8)], usedNames)
+		body, oversize := diffFile(chg.Path, opt, oldData, newData)
 
-		// Build patch body.
-		var body string
-		var oversize bool
-		if len(a) == 0 {
-			body, oversize = diff.Added("b/"+chg.Path, b, opt)
-		} else {
-			body, oversize = diff.Unified("a/"+chg.Path, "b/"+chg.Path, a, b, opt)
-			// Fallback if patch text looks suspiciously short or has no hunks
-			if tooShortOrNoHunks(body) {
-				body, oversize = diff.Added("b/"+chg.Path, b, opt)
-			}
-		}
-		out[patchName] = body
+		patches = append(patches, generatedPatch{name: patchName, body: body, oversize: oversize})
 
-		// Fill Delta.Change fields
-		chg.Oversize = oversize
-		chg.DiffPath = filepath.ToSlash(filepath.Join("diffs", patchName))
+		summary := summarizePatch(patchName, oversize)
+		chg.Oversize = summary.oversize
+		chg.DiffPath = summary.diffPath
 	}
 
-	// Further ordering determinism is applied when writing ZIP (sort keys before writing).
+	sorted := sortAndPackage(patches)
+	out := make(map[string]string, len(sorted))
+	for _, p := range sorted {
+		out[p.name] = p.body
+	}
 	return out, nil
+}
+
+type generatedPatch struct {
+	name     string
+	body     string
+	oversize bool
+}
+
+type patchSummary struct {
+	diffPath string
+	oversize bool
+}
+
+func diffFile(path string, opt diff.Options, oldData, newData []byte) (string, bool) {
+	aName := "a/" + path
+	bName := "b/" + path
+	if opt.NoPrefix {
+		aName = path
+		bName = path
+	}
+	if len(oldData) == 0 {
+		return diff.Added(bName, newData, opt)
+	}
+	body, oversize := diff.Unified(aName, bName, oldData, newData, opt)
+	if tooShortOrNoHunks(body) {
+		return diff.Added(bName, newData, opt)
+	}
+	return body, oversize
+}
+
+func summarizePatch(patchName string, oversize bool) patchSummary {
+	diffPath := filepath.ToSlash(filepath.Join("diffs", patchName))
+	return patchSummary{diffPath: diffPath, oversize: oversize}
+}
+
+func sortAndPackage(patches []generatedPatch) []generatedPatch {
+	if len(patches) <= 1 {
+		return patches
+	}
+	sort.Slice(patches, func(i, j int) bool { return patches[i].name < patches[j].name })
+	return patches
 }
 
 // min is a tiny helper to avoid importing math for integers.

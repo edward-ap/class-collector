@@ -46,13 +46,34 @@ var (
 	reBlock = regexp.MustCompile(`(?is)/\*\s*(region|endregion)\s*:?\s*([A-Za-z0-9_.\-]+)\s*\*/`)
 )
 
-// ExtractAnchors scans the file content and returns a sorted list of anchors.
-// The 'path' parameter is unused here but kept for potential diagnostics or
-// future heuristics.
+// ExtractAnchors orchestrates parsing, normalization, and deduplication.
 func ExtractAnchors(path string, data []byte) []Anchor {
+	raw, _ := parseAnchorsFromFile(path, data)
+	if len(raw) == 0 {
+		return nil
+	}
+	for i := range raw {
+		raw[i] = normalizeAnchor(raw[i])
+	}
+	merged := mergeAnchors(nil, raw)
+	if len(merged) <= 1 {
+		return merged
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Start != merged[j].Start {
+			return merged[i].Start < merged[j].Start
+		}
+		if merged[i].End != merged[j].End {
+			return merged[i].End < merged[j].End
+		}
+		return merged[i].Name < merged[j].Name
+	})
+	return merged
+}
+
+func parseAnchorsFromFile(_ string, data []byte) ([]Anchor, error) {
 	var anchors []Anchor
 
-	// --- 1) Line-based markers, with per-name stacks to support nesting ------
 	startsByName := make(map[string][]int)
 	lines := bytes.Split(data, []byte("\n"))
 	for i, b := range lines {
@@ -64,10 +85,8 @@ func ExtractAnchors(path string, data []byte) []Anchor {
 			}
 			switch strings.ToLower(kind) {
 			case "region":
-				// push start line for this name
 				startsByName[name] = append(startsByName[name], ln)
 			case "endregion":
-				// pop last start for this name (if any)
 				stack := startsByName[name]
 				if n := len(stack); n > 0 {
 					start := stack[n-1]
@@ -80,11 +99,9 @@ func ExtractAnchors(path string, data []byte) []Anchor {
 		}
 	}
 
-	// --- 2) Block-based markers "/* region: DOC_BLOCK_MARKER_EXAMPLE */ ... /* endregion: DOC_BLOCK_MARKER_EXAMPLE */"
-	// This pass supports interleaving/nesting by keeping an ordered stack.
 	type open struct {
 		name string
-		off  int // byte offset of the opening marker (for line calc)
+		off  int
 	}
 	var opens []open
 	matches := reBlock.FindAllSubmatchIndex(data, -1)
@@ -98,7 +115,6 @@ func ExtractAnchors(path string, data []byte) []Anchor {
 		case "region":
 			opens = append(opens, open{name: name, off: m[0]})
 		case "endregion":
-			// find matching last opener with the same name
 			for j := len(opens) - 1; j >= 0; j-- {
 				if opens[j].name == name {
 					startLine := 1 + bytes.Count(data[:opens[j].off], []byte("\n"))
@@ -112,23 +128,7 @@ func ExtractAnchors(path string, data []byte) []Anchor {
 			}
 		}
 	}
-
-	// --- 3) Deduplicate (same Name/Start/End can appear from different passes)
-	if len(anchors) > 1 {
-		anchors = dedupAnchors(anchors)
-	}
-
-	// --- 4) Deterministic ordering: by Start asc, then End asc, then Name asc
-	sort.Slice(anchors, func(i, j int) bool {
-		if anchors[i].Start != anchors[j].Start {
-			return anchors[i].Start < anchors[j].Start
-		}
-		if anchors[i].End != anchors[j].End {
-			return anchors[i].End < anchors[j].End
-		}
-		return anchors[i].Name < anchors[j].Name
-	})
-	return anchors
+	return anchors, nil
 }
 
 // matchLineMarker tries both //-style and #-style line markers.
@@ -140,6 +140,28 @@ func matchLineMarker(b []byte) (kind, name string, ok bool) {
 		return string(m[1]), string(m[2]), true
 	}
 	return "", "", false
+}
+
+func normalizeAnchor(a Anchor) Anchor {
+	if a.Start < 1 {
+		a.Start = 1
+	}
+	if a.End < a.Start {
+		a.End = a.Start
+	}
+	a.Name = strings.TrimSpace(a.Name)
+	return a
+}
+
+func mergeAnchors(dst []Anchor, src []Anchor) []Anchor {
+	if len(src) == 0 {
+		return dst
+	}
+	dst = append(dst, src...)
+	if len(dst) > 1 {
+		dst = dedupAnchors(dst)
+	}
+	return dst
 }
 
 // dedupAnchors removes exact duplicates (same Name/Start/End), preserving order.

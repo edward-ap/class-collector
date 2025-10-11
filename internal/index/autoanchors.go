@@ -10,15 +10,15 @@ import (
 
 // AutoAnchorConfig controls virtual anchor generation.
 type AutoAnchorConfig struct {
-	Enabled        bool   // master switch
-	MinLines       int    // skip regions shorter than this (lines = End-Start+1)
-	MaxPerFile     int    // hard cap per file (0 = unlimited)
-	IncludeImports bool   // add a single IMPORTS anchor if an import block is present
-	IncludeTests   bool   // add anchors for test functions (Go: Test*/Benchmark*/Example*; TS: it/describe)
-	Prefix         string // prefix for auto anchor names, e.g. "auto:"; empty = no prefix
+	Enabled        bool
+	MinLines       int
+	MaxPerFile     int
+	IncludeImports bool
+	IncludeTests   bool
+	Prefix         string
 }
 
-// Default config (balanced and language-agnostic).
+// DefaultAutoAnchorConfig returns the default heuristic configuration.
 func DefaultAutoAnchorConfig() AutoAnchorConfig {
 	return AutoAnchorConfig{
 		Enabled:        true,
@@ -30,161 +30,247 @@ func DefaultAutoAnchorConfig() AutoAnchorConfig {
 	}
 }
 
-// Package-level knob set from main() once; keeps BuildArtifacts signature stable.
 var autoCfg = DefaultAutoAnchorConfig()
 
-// SetAutoAnchorsConfig is called from the CLI to adjust defaults.
+// SetAutoAnchorsConfig overrides the global auto-anchor configuration.
 func SetAutoAnchorsConfig(c AutoAnchorConfig) { autoCfg = c }
 
-// BuildAutoAnchors derives virtual anchors from symbols + simple file heuristics.
-// It never edits source files: anchors are synthesized and appended to the list.
+type anchorCandidate struct {
+	anchor Anchor
+	order  int
+}
+
+type anchorContext struct {
+	relPath    string
+	data       []byte
+	lang       string
+	symbols    []Symbol
+	totalLines int
+}
+
+// BuildAutoAnchors derives virtual anchors from symbols + heuristics.
 func BuildAutoAnchors(relPath string, data []byte, lang string, syms []Symbol, existing []Anchor, totalLines int) []Anchor {
-	if !autoCfg.Enabled || totalLines < 1 {
+	cfg, err := parseAutoAnchorConfig(data)
+	if err != nil || !cfg.Enabled || totalLines < 1 {
 		return nil
 	}
-	minLines := autoCfg.MinLines
-	if minLines < 1 {
-		minLines = 1
+	ctx := anchorContext{
+		relPath:    relPath,
+		data:       data,
+		lang:       lang,
+		symbols:    syms,
+		totalLines: totalLines,
 	}
-
-	// 1) Symbol-backed anchors: one per symbol (method/func/ctor).
-	var out []Anchor
-	for _, s := range syms {
-		start, end := s.Start, s.End
-		if start < 1 {
-			start = 1
-		}
-		if end < start {
-			end = start
-		}
-		if (end - start + 1) < minLines {
-			continue
-		}
-		name := autoCfg.Prefix + symbolAnchorName(s, lang)
-		out = append(out, Anchor{Name: name, Start: start, End: end})
+	cands, err := collectAnchorCandidates(ctx, cfg)
+	if err != nil || len(cands) == 0 {
+		return nil
 	}
-
-	// 2) Imports block: cheap, useful split near file top.
-	if autoCfg.IncludeImports {
-		if a, ok := importAnchor(relPath, data, lang); ok {
-			if (a.End - a.Start + 1) >= minLines {
-				a.Name = autoCfg.Prefix + a.Name
-				out = append(out, a)
-			}
-		}
+	ranked, err := rankAndFilterAnchors(cands, cfg)
+	if err != nil || len(ranked) == 0 {
+		return nil
 	}
-
-	// 3) Test-specific anchors (language-aware, optional).
-	if autoCfg.IncludeTests {
-		if ta := testAnchors(relPath, data, lang); len(ta) > 0 {
-			for i := range ta {
-				if (ta[i].End - ta[i].Start + 1) >= minLines {
-					ta[i].Name = autoCfg.Prefix + ta[i].Name
-					out = append(out, ta[i])
-				}
-			}
-		}
-	}
-
-	// 4) Coarse region anchors by language (gated by MinLines)
-	switch lang {
-	case "go":
-		// const block
-		if a, ok := coarseRegion(data, `(?ms)^\s*const\s*\([^)]*\)`, "CONSTS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-		// const single-line declarations (may be scattered)
-		if a, ok := coarseRange(data, `(?m)^\s*const\s+\w`, "CONSTS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-		if a, ok := coarseRange(data, `(?m)^\s*type\s+[A-Za-z_]\w*\b`, "TYPES"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-		if a, ok := coarseRange(data, `(?m)^\s*func\s+(?:\([^)]*\)\s*)?[A-Za-z_]\w*\s*\(`, "FUNCS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-	case "ts":
-		if a, ok := coarseRange(data, `(?m)^\s*export\s+(?:const|let|var)\s+`, "CONSTS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-		if a, ok := coarseRange(data, `(?m)^\s*export\s+(?:interface|type|class)\b`, "TYPES"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-		if a, ok := coarseRange(data, `(?m)^\s*export\s+(?:async\s+)?function\b|^\s*export\s+const\s+[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>`, "FUNCS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-	case "java":
-		if a, ok := coarseRange(data, `(?m)^\s*(?:public|protected|private|static|final|synchronized|native|abstract|default|strictfp|)\s*[\w<>\[\]]+\s+[A-Za-z_]\w*\s*\(`, "METHODS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-		if a, ok := coarseRange(data, `(?m)^\s*(?:public|protected|private)\s+[A-Z][A-Za-z0-9_]*\s*\(`, "CTORS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-		if a, ok := coarseRange(data, `(?m)^\s*(?:public|protected|private|static|final)\s+[\w<>\[\],\s]+;\s*$`, "FIELDS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-	case "cs":
-		if a, ok := coarseRange(data, `(?m)^\s*(?:public|internal|protected|private|static|virtual|override|sealed|async|extern|unsafe|new)\s+.*\(`, "METHODS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-		if a, ok := coarseRange(data, `(?m)^\s*(?:public|internal|protected|private)\s+[A-Z][A-Za-z0-9_]*\s*\(`, "CTORS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-		if a, ok := coarseRange(data, `(?m)^\s*(?:public|internal|protected|private|static|readonly|const|volatile)\s+[^;]+;\s*$`, "FIELDS"); ok && (a.End-a.Start+1) >= minLines {
-			out = append(out, prefixed(a))
-		}
-	}
-
-	// Normalize: clamp, sort, dedup exact matches and drop exact overlaps with explicit anchors.
-	out = normalizeAutoAnchors(out, existing, totalLines)
-
-	// Cap per-file if requested.
-	if autoCfg.MaxPerFile > 0 && len(out) > autoCfg.MaxPerFile {
-		out = out[:autoCfg.MaxPerFile]
+	out, err := writeAnchors(existing, ranked, totalLines)
+	if err != nil {
+		return nil
 	}
 	return out
 }
 
-// ----------------- helpers -----------------
+func parseAutoAnchorConfig(_ []byte) (AutoAnchorConfig, error) {
+	cfg := autoCfg
+	if cfg.MinLines < 1 {
+		cfg.MinLines = 1
+	}
+	if cfg.MaxPerFile < 0 {
+		cfg.MaxPerFile = 0
+	}
+	return cfg, nil
+}
+
+func collectAnchorCandidates(ctx anchorContext, cfg AutoAnchorConfig) ([]anchorCandidate, error) {
+	minLines := cfg.MinLines
+	var cands []anchorCandidate
+	order := 0
+
+	for _, s := range ctx.symbols {
+		a, ok := symbolCandidate(s, ctx.lang, cfg.Prefix, minLines)
+		if !ok {
+			continue
+		}
+		cands = append(cands, anchorCandidate{anchor: a, order: order})
+		order++
+	}
+
+	if cfg.IncludeImports {
+		if imp, ok := importAnchor(ctx.data, ctx.lang); ok && linespan(imp) >= minLines {
+			imp.Name = cfg.Prefix + imp.Name
+			cands = append(cands, anchorCandidate{anchor: imp, order: order})
+			order++
+		}
+	}
+
+	if cfg.IncludeTests {
+		tests := testAnchors(ctx.relPath, ctx.data, ctx.lang)
+		for i := range tests {
+			if linespan(tests[i]) < minLines {
+				continue
+			}
+			tests[i].Name = cfg.Prefix + tests[i].Name
+			cands = append(cands, anchorCandidate{anchor: tests[i], order: order})
+			order++
+		}
+	}
+
+	for _, coarse := range coarseAnchors(ctx.data, ctx.lang, cfg.Prefix) {
+		if linespan(coarse) < minLines {
+			continue
+		}
+		cands = append(cands, anchorCandidate{anchor: coarse, order: order})
+		order++
+	}
+
+	return cands, nil
+}
+
+func rankAndFilterAnchors(cands []anchorCandidate, cfg AutoAnchorConfig) ([]Anchor, error) {
+	if len(cands) == 0 {
+		return nil, nil
+	}
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, b := cands[i].anchor, cands[j].anchor
+		if a.Start != b.Start {
+			return a.Start < b.Start
+		}
+		if a.End != b.End {
+			return a.End < b.End
+		}
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		return cands[i].order < cands[j].order
+	})
+	anchors := make([]Anchor, 0, len(cands))
+	for _, c := range cands {
+		anchors = append(anchors, c.anchor)
+	}
+	if cfg.MaxPerFile > 0 && len(anchors) > cfg.MaxPerFile {
+		anchors = anchors[:cfg.MaxPerFile]
+	}
+	return anchors, nil
+}
+
+func writeAnchors(existing []Anchor, autoAnchors []Anchor, total int) ([]Anchor, error) {
+	out := normalizeAutoAnchors(autoAnchors, existing, total)
+	return out, nil
+}
+
+func symbolCandidate(s Symbol, lang, prefix string, minLines int) (Anchor, bool) {
+	start := s.Start
+	end := s.End
+	if start < 1 {
+		start = 1
+	}
+	if end < start {
+		end = start
+	}
+	if (end - start + 1) < minLines {
+		return Anchor{}, false
+	}
+	name := prefix + symbolAnchorName(s, lang)
+	return Anchor{Name: name, Start: start, End: end}, true
+}
+
+func linespan(a Anchor) int {
+	return a.End - a.Start + 1
+}
+
+func coarseAnchors(data []byte, lang, prefix string) []Anchor {
+	var out []Anchor
+	switch lang {
+	case "go":
+		if a, ok := coarseRegion(data, `(?ms)^\s*const\s*\([^)]*\)`, "CONSTS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+		if a, ok := coarseRange(data, `(?m)^\s*const\s+\w`, "CONSTS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+		if a, ok := coarseRange(data, `(?m)^\s*type\s+[A-Za-z_]\w*\b`, "TYPES"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+		if a, ok := coarseRange(data, `(?m)^\s*func\s+(?:\([^)]*\)\s*)?[A-Za-z_]\w*\s*\(`, "FUNCS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+	case "ts":
+		if a, ok := coarseRange(data, `(?m)^\s*export\s+(?:const|let|var)\s+`, "CONSTS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+		if a, ok := coarseRange(data, `(?m)^\s*export\s+(?:interface|type|class)\b`, "TYPES"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+		if a, ok := coarseRange(data, `(?m)^\s*export\s+(?:async\s+)?function\b|^\s*export\s+const\s+[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>`, "FUNCS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+	case "java":
+		if a, ok := coarseRange(data, `(?m)^\s*(?:public|protected|private|static|final|synchronized|native|abstract|default|strictfp|)\s*[\w<>\[\]]+\s+[A-Za-z_]\w*\s*\(`, "METHODS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+		if a, ok := coarseRange(data, `(?m)^\s*(?:public|protected|private)\s+[A-Z][A-Za-z0-9_]*\s*\(`, "CTORS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+		if a, ok := coarseRange(data, `(?m)^\s*(?:public|protected|private|static|final)\s+[\w<>\[\],\s]+;\s*$`, "FIELDS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+	case "cs":
+		if a, ok := coarseRange(data, `(?m)^\s*(?:public|internal|protected|private|static|virtual|override|sealed|async|extern|unsafe|new)\s+.*\(`, "METHODS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+		if a, ok := coarseRange(data, `(?m)^\s*(?:public|internal|protected|private)\s+[A-Z][A-Za-z0-9_]*\s*\(`, "CTORS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+		if a, ok := coarseRange(data, `(?m)^\s*(?:public|internal|protected|private|static|readonly|const|volatile)\s+[^;]+;\s*$`, "FIELDS"); ok {
+			out = append(out, prefixedWith(a, prefix))
+		}
+	}
+	return out
+}
+
+func prefixedWith(a Anchor, prefix string) Anchor {
+	a.Name = prefix + a.Name
+	return a
+}
 
 func symbolAnchorName(s Symbol, lang string) string {
-	// Prefer a compact readable name:
-	//  Java:  org.acme.Server.start -> "SYM:Server.start"
-	//  Go:    mypkg.Conn.Open       -> "SYM:Conn.Open" or "SYM:mypkg.main"
-	//  TS:    (typ?) . name         -> "SYM:<Type>.name" or "SYM:name"
-	base := s.Symbol
-	// Keep the last two segments if possible ("Type.member"); else last one.
-	parts := strings.Split(base, ".")
+	parts := strings.Split(s.Symbol, ".")
 	if len(parts) >= 2 {
 		return "SYM:" + parts[len(parts)-2] + "." + parts[len(parts)-1]
 	}
-	return "SYM:" + base
+	return "SYM:" + s.Symbol
 }
 
-func importAnchor(relPath string, data []byte, lang string) (Anchor, bool) {
+func importAnchor(data []byte, lang string) (Anchor, bool) {
 	switch lang {
 	case "java":
-		// Consecutive lines starting with "import " near top.
 		lines := bytes.Split(data, []byte("\n"))
 		first, last := 0, 0
-		seen := false
-		for i := 0; i < len(lines) && i < 400; i++ { // scan only the top chunk
+		found := false
+		for i := 0; i < len(lines) && i < 400; i++ {
 			ln := strings.TrimSpace(string(lines[i]))
 			if strings.HasPrefix(ln, "import ") {
-				if !seen {
+				if !found {
 					first = i + 1
-					seen = true
+					found = true
 				}
 				last = i + 1
-			} else if seen && ln != "" && !strings.HasPrefix(ln, "//") {
+				continue
+			}
+			if found && ln != "" && !strings.HasPrefix(ln, "//") {
 				break
 			}
 		}
-		if seen && last >= first {
+		if found && last >= first {
 			return Anchor{Name: "IMPORTS", Start: first, End: last}, true
 		}
 	case "go":
-		// import "x" OR import (...) block
 		reTopImport := regexp.MustCompile(`(?ms)^\s*import\s+(?:\([^\)]*\)|"[^"]+")`)
 		if loc := reTopImport.FindIndex(data); loc != nil {
 			start := 1 + bytes.Count(data[:loc[0]], []byte("\n"))
@@ -192,14 +278,14 @@ func importAnchor(relPath string, data []byte, lang string) (Anchor, bool) {
 			return Anchor{Name: "IMPORTS", Start: start, End: end}, true
 		}
 	case "ts":
-		// one or more consecutive "import ..." lines at very top
 		reImp := regexp.MustCompile(`(?m)^\s*import\s+[^;]+;?\s*$`)
 		m := reImp.FindAllIndex(data, -1)
-		if len(m) > 0 && m[0][0] < 600 { // only if at file start-ish
-			first := 1 + bytes.Count(data[:m[0][0]], []byte("\n"))
-			last := 1 + bytes.Count(data[:m[len(m)-1][1]], []byte("\n"))
-			return Anchor{Name: "IMPORTS", Start: first, End: last}, true
+		if len(m) == 0 || m[0][0] >= 600 {
+			return Anchor{}, false
 		}
+		first := 1 + bytes.Count(data[:m[0][0]], []byte("\n"))
+		last := 1 + bytes.Count(data[:m[len(m)-1][1]], []byte("\n"))
+		return Anchor{Name: "IMPORTS", Start: first, End: last}, true
 	}
 	return Anchor{}, false
 }
@@ -207,7 +293,6 @@ func importAnchor(relPath string, data []byte, lang string) (Anchor, bool) {
 func testAnchors(relPath string, data []byte, lang string) []Anchor {
 	switch lang {
 	case "go":
-		// Go tests are in *_test.go with funcs: TestXxx/BenchmarkXxx/ExampleXxx
 		if !strings.HasSuffix(relPath, "_test.go") {
 			return nil
 		}
@@ -216,12 +301,10 @@ func testAnchors(relPath string, data []byte, lang string) []Anchor {
 		var out []Anchor
 		for _, loc := range locs {
 			start := 1 + bytes.Count(data[:loc[0]], []byte("\n"))
-			// End will be refined later; here we give a minimal 1-line region
 			out = append(out, Anchor{Name: "TEST", Start: start, End: start})
 		}
 		return out
 	case "ts":
-		// jest/mocha style: describe(...), it(...), test(...)
 		re := regexp.MustCompile(`(?m)^\s*(describe|it|test)\s*\(`)
 		locs := re.FindAllIndex(data, -1)
 		var out []Anchor
@@ -235,13 +318,7 @@ func testAnchors(relPath string, data []byte, lang string) []Anchor {
 	}
 }
 
-func prefixed(a Anchor) Anchor {
-	a.Name = autoCfg.Prefix + a.Name
-	return a
-}
-
-// coarseRange returns a single anchor covering first..last occurrence of pattern lines.
-func coarseRange(data []byte, pattern string, name string) (Anchor, bool) {
+func coarseRange(data []byte, pattern, name string) (Anchor, bool) {
 	re := regexp.MustCompile(pattern)
 	locs := re.FindAllIndex(data, -1)
 	if len(locs) == 0 {
@@ -252,22 +329,21 @@ func coarseRange(data []byte, pattern string, name string) (Anchor, bool) {
 	return Anchor{Name: name, Start: first, End: last}, true
 }
 
-// coarseRegion returns the exact span matched by a single region pattern (first match only).
-func coarseRegion(data []byte, pattern string, name string) (Anchor, bool) {
+func coarseRegion(data []byte, pattern, name string) (Anchor, bool) {
 	re := regexp.MustCompile(pattern)
-	if loc := re.FindIndex(data); loc != nil {
-		first := 1 + bytes.Count(data[:loc[0]], []byte("\n"))
-		last := 1 + bytes.Count(data[:loc[1]], []byte("\n"))
-		return Anchor{Name: name, Start: first, End: last}, true
+	loc := re.FindIndex(data)
+	if loc == nil {
+		return Anchor{}, false
 	}
-	return Anchor{}, false
+	first := 1 + bytes.Count(data[:loc[0]], []byte("\n"))
+	last := 1 + bytes.Count(data[:loc[1]], []byte("\n"))
+	return Anchor{Name: name, Start: first, End: last}, true
 }
 
 func normalizeAutoAnchors(in []Anchor, explicit []Anchor, total int) []Anchor {
 	if len(in) == 0 {
 		return nil
 	}
-	// Clamp & sort (Start, End, Name)
 	for i := range in {
 		if in[i].Start < 1 {
 			in[i].Start = 1
@@ -288,44 +364,40 @@ func normalizeAutoAnchors(in []Anchor, explicit []Anchor, total int) []Anchor {
 		}
 		return in[i].Name < in[j].Name
 	})
-	// Dedup exact duplicates.
 	uniq := make([]Anchor, 0, len(in))
 	for i, a := range in {
 		if i > 0 {
-			p := in[i-1]
-			if a.Name == p.Name && a.Start == p.Start && a.End == p.End {
+			prev := in[i-1]
+			if prev.Name == a.Name && prev.Start == a.Start && prev.End == a.End {
 				continue
 			}
 		}
 		uniq = append(uniq, a)
 	}
-	in = uniq
-
-	// Drop anchors that exactly duplicate explicit ones.
-	if len(explicit) > 0 {
-		type key struct {
-			n    string
-			s, e int
-		}
-		exp := make(map[key]struct{}, len(explicit))
-		for _, a := range explicit {
-			exp[key{a.Name, a.Start, a.End}] = struct{}{}
-		}
-		out := in[:0]
-		for _, a := range in {
-			if _, dup := exp[key{a.Name, a.Start, a.End}]; !dup {
-				out = append(out, a)
-			}
-		}
-		in = out
+	if len(explicit) == 0 {
+		return uniq
 	}
-	return in
+	type key struct {
+		name       string
+		start, end int
+	}
+	exp := make(map[key]struct{}, len(explicit))
+	for _, a := range explicit {
+		exp[key{a.Name, a.Start, a.End}] = struct{}{}
+	}
+	out := uniq[:0]
+	for _, a := range uniq {
+		if _, ok := exp[key{a.Name, a.Start, a.End}]; ok {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
-// Language inference helper mirrored from symbols_common.go (to avoid cyclic deps if needed).
 func fileLangByExt(relPath string) string {
-	e := strings.ToLower(filepath.Ext(relPath))
-	switch e {
+	ext := strings.ToLower(filepath.Ext(relPath))
+	switch ext {
 	case ".java":
 		return "java"
 	case ".go":

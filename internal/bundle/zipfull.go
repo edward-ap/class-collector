@@ -24,10 +24,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"class-collector/internal/graph"
 	"class-collector/internal/index"
+	"class-collector/internal/textutil"
+	"class-collector/internal/ziputil"
 )
 
 // WriteFull writes the full bundle zip.
@@ -40,13 +43,14 @@ func WriteFull(
 	pointers []index.Pointer,
 	g graph.Graph,
 	emitSrc bool,
+	benchPath string,
+	diffContext int,
+	diffNoPrefix bool,
 ) error {
-	// Ensure output directory exists.
+	_ = root
 	if err := os.MkdirAll(filepath.Dir(zipPath), 0o755); err != nil {
 		return err
 	}
-
-	// Create output file and ZIP writer.
 	f, err := os.Create(zipPath)
 	if err != nil {
 		return err
@@ -56,29 +60,66 @@ func WriteFull(
 	zw := zip.NewWriter(f)
 	defer zw.Close()
 
-	// 1) Core JSON artifacts (deterministic order & timestamps)
-	if err := writeJSONEntry(zw, "manifest.json", man); err != nil {
+	art := index.Artifacts{
+		Manifest: man,
+		Symbols:  syms,
+		Slices:   slices,
+		Pointers: pointers,
+		Graph:    g,
+	}
+
+	if err := writeCoreJson(zw, art); err != nil {
 		return err
 	}
-	if err := writeJSONEntry(zw, "symbols.json", syms); err != nil {
+
+	fullLangs := supportedLangs()
+	presentLangs := presentLangsFromManifest(man)
+
+	readmeOpts := ReadmeOptions{
+		ModuleName:       man.Module,
+		SupportedLangs:   fullLangs,
+		PresentLangs:     presentLangs,
+		DiffNoPrefix:     diffNoPrefix,
+		ContextLines:     diffContext,
+		IncludeBenchNote: strings.TrimSpace(benchPath) != "",
+		IncludeFullNotes: true,
+	}
+
+	if err := writeReadmeFull(zw, readmeOpts); err != nil {
 		return err
 	}
-	// OPTIONAL: write plain-text bundle id for quick checks
-	if man.BundleID != "" {
-		if err := writeTextEntry(zw, "BUNDLE.ID", []byte(man.BundleID+"\n")); err != nil {
+	if err := writeToc(zw, man); err != nil {
+		return err
+	}
+	if err := writeSourcesIfEnabled(zw, files, emitSrc); err != nil {
+		return err
+	}
+	if err := writeBenchIfPresent(zw, benchPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeCoreJson(zw *zip.Writer, art index.Artifacts) error {
+	if err := ziputil.WriteJSON(zw, "manifest.json", art.Manifest); err != nil {
+		return err
+	}
+	if err := ziputil.WriteJSON(zw, "symbols.json", art.Symbols); err != nil {
+		return err
+	}
+	if art.Manifest.BundleID != "" {
+		id := textutil.EnsureTrailingLF(textutil.NormalizeUTF8LF([]byte(art.Manifest.BundleID)))
+		if err := ziputil.WriteText(zw, "BUNDLE.ID", id); err != nil {
 			return err
 		}
 	}
-
-	// graph.json — write real graph
-	if err := writeJSONEntry(zw, "graph.json", g); err != nil {
+	if err := ziputil.WriteJSON(zw, "graph.json", art.Graph); err != nil {
 		return err
 	}
 
-	// Sort and write slices.jsonl (if any)
-	if len(slices) > 0 {
-		sorted := make([]index.Slice, len(slices))
-		copy(sorted, slices)
+	if len(art.Slices) > 0 {
+		sorted := make([]index.Slice, len(art.Slices))
+		copy(sorted, art.Slices)
 		sort.Slice(sorted, func(i, j int) bool {
 			if sorted[i].Path == sorted[j].Path {
 				if sorted[i].Start == sorted[j].Start {
@@ -95,10 +136,9 @@ func WriteFull(
 		}
 	}
 
-	// Sort and write pointers.jsonl (if any)
-	if len(pointers) > 0 {
-		sorted := make([]index.Pointer, len(pointers))
-		copy(sorted, pointers)
+	if len(art.Pointers) > 0 {
+		sorted := make([]index.Pointer, len(art.Pointers))
+		copy(sorted, art.Pointers)
 		sort.Slice(sorted, func(i, j int) bool {
 			if sorted[i].ID == sorted[j].ID {
 				if sorted[i].Path == sorted[j].Path {
@@ -114,59 +154,67 @@ func WriteFull(
 			return err
 		}
 	}
-
-	// README.md — stable content, no wall-clock timestamp to keep ZIP reproducible
-	{
-		const readme = "# Bundle\n\n" +
-			"Module: %s\n\n" +
-			"Artifacts: manifest.json, symbols.json, slices.jsonl, pointers.jsonl, graph.json\n"
-		body := []byte(fmtPrintf(readme, man.Module))
-		if err := writeTextEntry(zw, "README.md", body); err != nil {
-			return err
-		}
-	}
-
-	// TOC.md — quick table of contents from manifest (path + line count)
-	{
-		var b strings.Builder
-		b.WriteString("# TOC\n\n| # | Path | Lines |\n|---:|:-----|-----:|\n")
-		for i, f := range man.Files {
-			b.WriteString("| ")
-			b.WriteString(itoa(i + 1))
-			b.WriteString(" | ")
-			b.WriteString(f.Path)
-			b.WriteString(" | ")
-			b.WriteString(itoa(f.Lines))
-			b.WriteString(" |\n")
-		}
-		if err := writeTextEntry(zw, "TOC.md", []byte(b.String())); err != nil {
-			return err
-		}
-	}
-
-	// src/ — optional emission of source files (sorted for determinism)
-	if emitSrc && len(files) > 0 {
-		sorted := make([]struct{ RelPath, AbsPath string }, len(files))
-		copy(sorted, files)
-		sort.Slice(sorted, func(i, j int) bool { return sorted[i].RelPath < sorted[j].RelPath })
-
-		for _, fi := range sorted {
-			zname := filepath.ToSlash(filepath.Join("src", fi.RelPath))
-			zname = sanitizeZipPath(zname)
-			if err := writeFileEntry(zw, zname, fi.AbsPath); err != nil {
-				return err
-			}
-		}
-	}
-
 	return nil
 }
 
-// writeJSONLEntry writes line-delimited JSON (one JSON object per line).
+func writeReadmeFull(zw *zip.Writer, opts ReadmeOptions) error {
+	readme := GenerateFullReadme(opts)
+	readme = textutil.EnsureTrailingLF(textutil.NormalizeUTF8LF(readme))
+	return ziputil.WriteText(zw, "README.md", readme)
+}
+
+func writeToc(zw *zip.Writer, man index.Manifest) error {
+	var b strings.Builder
+	b.WriteString("# TOC\n\n| # | Path | Lines |\n|---:|:-----|-----:|\n")
+	for i, f := range man.Files {
+		b.WriteString("| ")
+		b.WriteString(strconv.Itoa(i + 1))
+		b.WriteString(" | ")
+		b.WriteString(f.Path)
+		b.WriteString(" | ")
+		b.WriteString(strconv.Itoa(f.Lines))
+		b.WriteString(" |\n")
+	}
+	text := textutil.EnsureTrailingLF(textutil.NormalizeUTF8LF([]byte(b.String())))
+	return ziputil.WriteText(zw, "TOC.md", text)
+}
+
+func writeSourcesIfEnabled(zw *zip.Writer, files []struct{ RelPath, AbsPath string }, emit bool) error {
+	if !emit || len(files) == 0 {
+		return nil
+	}
+	sorted := make([]struct{ RelPath, AbsPath string }, len(files))
+	copy(sorted, files)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].RelPath < sorted[j].RelPath })
+	for _, fi := range sorted {
+		zname := filepath.ToSlash(filepath.Join("src", fi.RelPath))
+		zname = ziputil.SanitizePath(zname)
+		data, err := os.ReadFile(fi.AbsPath)
+		if err != nil {
+			return err
+		}
+		if err := ziputil.WriteFile(zw, zname, data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeBenchIfPresent(zw *zip.Writer, benchPath string) error {
+	if strings.TrimSpace(benchPath) == "" {
+		return nil
+	}
+	data, err := os.ReadFile(benchPath)
+	if err != nil {
+		return err
+	}
+	return ziputil.WriteFile(zw, "bench.txt", data)
+}
+
 func writeJSONLEntry(zw *zip.Writer, name string, items any, marshalEach func(it any) ([]byte, error)) error {
-	h := &zip.FileHeader{Name: sanitizeZipPath(name), Method: zip.Deflate}
+	h := &zip.FileHeader{Name: ziputil.SanitizePath(name), Method: zip.Deflate}
 	h.SetMode(0o644)
-	h.Modified = fixedZipTime
+	h.Modified = ziputil.FixedZipTime
 
 	w, err := zw.CreateHeader(h)
 	if err != nil {
@@ -188,8 +236,36 @@ func writeJSONLEntry(zw *zip.Writer, name string, items any, marshalEach func(it
 	return nil
 }
 
-// fmtPrintf avoids importing fmt globally for a single formatted write.
-func fmtPrintf(format, module string) string {
-	// minimal formatter for "%s"
-	return strings.Replace(format, "%s", module, 1)
+func presentLangsFromManifest(man index.Manifest) []string {
+	seen := map[string]struct{}{}
+	add := func(p string) {
+		ext := strings.ToLower(filepath.Ext(p))
+		switch ext {
+		case ".go":
+			seen["go"] = struct{}{}
+		case ".java":
+			seen["java"] = struct{}{}
+		case ".kt":
+			seen["kt"] = struct{}{}
+		case ".cs":
+			seen["cs"] = struct{}{}
+		case ".ts":
+			seen["ts"] = struct{}{}
+		case ".tsx":
+			seen["tsx"] = struct{}{}
+		case ".py":
+			seen["py"] = struct{}{}
+		case ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".h":
+			seen["cpp"] = struct{}{}
+		}
+	}
+	for _, f := range man.Files {
+		add(f.Path)
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

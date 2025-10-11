@@ -25,29 +25,44 @@ func BuildSymbolPointers(symbols []Symbol) []Pointer {
 		return nil
 	}
 
-	// Work on a sorted view for deterministic output.
+	index := buildPointerIndex(symbols)
+	if len(index) == 0 {
+		return nil
+	}
+	unique := dedupPointers(index)
+	sort.Slice(unique, func(i, j int) bool {
+		if unique[i].ID != unique[j].ID {
+			return unique[i].ID < unique[j].ID
+		}
+		if unique[i].Path != unique[j].Path {
+			return unique[i].Path < unique[j].Path
+		}
+		if unique[i].Start != unique[j].Start {
+			return unique[i].Start < unique[j].Start
+		}
+		return unique[i].End < unique[j].End
+	})
+	return unique
+}
+
+func buildPointerIndex(symbols []Symbol) []Pointer {
 	sorted := make([]Symbol, 0, len(symbols))
 	sorted = append(sorted, symbols...)
 	sort.Slice(sorted, func(i, j int) bool {
-		// Primary: symbol string (so ID base becomes deterministic)
 		if sorted[i].Symbol != sorted[j].Symbol {
 			return sorted[i].Symbol < sorted[j].Symbol
 		}
-		// Secondary: path
 		if sorted[i].Path != sorted[j].Path {
 			return sorted[i].Path < sorted[j].Path
 		}
-		// Tertiary: start line
 		if sorted[i].Start != sorted[j].Start {
 			return sorted[i].Start < sorted[j].Start
 		}
-		// Finally: end line
 		return sorted[i].End < sorted[j].End
 	})
 
 	seen := make(map[string]int, len(sorted))
 	out := make([]Pointer, 0, len(sorted))
-
 	for _, s := range sorted {
 		if s.Symbol == "" {
 			continue
@@ -77,20 +92,27 @@ func BuildSymbolPointers(symbols []Symbol) []Pointer {
 			End:   end,
 		})
 	}
+	return out
+}
 
-	// Final deterministic order: by ID, then Path, then Start/End.
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].ID != out[j].ID {
-			return out[i].ID < out[j].ID
+func dedupPointers(in []Pointer) []Pointer {
+	if len(in) <= 1 {
+		return in
+	}
+	type key struct {
+		id         string
+		path       string
+		start, end int
+	}
+	seen := make(map[key]struct{}, len(in))
+	out := make([]Pointer, 0, len(in))
+	for _, p := range in {
+		k := key{p.ID, p.Path, p.Start, p.End}
+		if _, ok := seen[k]; ok {
+			continue
 		}
-		if out[i].Path != out[j].Path {
-			return out[i].Path < out[j].Path
-		}
-		if out[i].Start != out[j].Start {
-			return out[i].Start < out[j].Start
-		}
-		return out[i].End < out[j].End
-	})
-
+		seen[k] = struct{}{}
+		out = append(out, p)
+	}
 	return out
 }
